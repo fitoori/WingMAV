@@ -26,7 +26,7 @@ Logging:
     
 Autoload:
     - Place this file in your MAVProxy modules folder.
-    - To auto-load on startup, add the line: module load joystickctrl in your ~/.mavinit.rc
+    - To auto-load on startup, add the line: module load wingmav in your ~/.mavinit.rc
 
 Author: github.com/fitoori
 Date: March 5, 2025
@@ -77,7 +77,7 @@ class JoystickControlModule(mp_module.MPModule):
         - ``auto_connect``: defer joystick discovery until requested explicitly.
         - ``pygame_module``: inject a pygame-compatible shim for unit testing.
         """
-        super(JoystickControlModule, self).__init__(mpstate, "joystickctrl", "Joystick control module")
+        super(JoystickControlModule, self).__init__(mpstate, "wingmav", "Joystick control module")
         # Use instance variable for logging configuration
         if log_to_file is None:
             log_to_file = LOG_TO_FILE
