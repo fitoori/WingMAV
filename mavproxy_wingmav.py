@@ -96,6 +96,11 @@ class JoystickControlModule(mp_module.MPModule):
         self._pygame_ready = False
         self._auto_connect = auto_connect
         self._pg = pygame_module if pygame_module is not None else pygame
+        self._pending_mode_change = None
+        self._pending_mode_success = None
+        self._pending_mode_failure = None
+        self._pending_mode_plan = []
+        self._pending_disarm_ack = None
 
         # Initialize logging if enabled
         if self.log_enabled:
@@ -192,7 +197,12 @@ class JoystickControlModule(mp_module.MPModule):
                         self._activate_control()
                 elif event.button == BTN_RTL:
                     self._log("RTL button pressed → Switching to RTL mode")
-                    self._set_flight_mode("RTL")
+                    self._set_flight_mode(
+                        "RTL",
+                        success_msg="RTL button pressed → Vehicle confirmed RTL mode",
+                        pending_msg="RTL button pressed → Requested RTL mode; awaiting confirmation.",
+                        failure_msg="RTL button pressed → Failed to change to RTL mode.",
+                    )
                 elif event.button == BTN_DISARM:
                     self._log("Disarm button pressed → Disarming the vehicle")
                     self._disarm_vehicle()
@@ -220,6 +230,9 @@ class JoystickControlModule(mp_module.MPModule):
             if time.time() - self.last_override_time > 0.1:
                 self._send_override()
 
+        self._check_pending_mode_change()
+        self._process_disarm_ack()
+
     def _activate_control(self):
         """Activate joystick control: save neutral offsets, switch to GUIDED mode, and begin RC override."""
         self.prev_mode = self.status.flightmode
@@ -230,10 +243,12 @@ class JoystickControlModule(mp_module.MPModule):
         except Exception as e:
             self._log(f"ERROR reading joystick axes for centering: {e}", error=True)
             return
-        if self._set_flight_mode("GUIDED"):
-            self._log("Trigger pressed → Entering GUIDED mode and enabling joystick control")
-        else:
-            self._log("Trigger pressed → Enabling joystick control (GUIDED mode switch FAILED, continuing in current mode)", error=True)
+        self._set_flight_mode(
+            "GUIDED",
+            success_msg="Trigger pressed → Entering GUIDED mode and enabling joystick control",
+            pending_msg="Trigger pressed → Requested GUIDED mode; awaiting confirmation before continuing.",
+            failure_msg="Trigger pressed → GUIDED mode switch FAILED, continuing in current mode.",
+        )
         self.control_active = True
         self._send_override(force=True)
 
@@ -242,19 +257,27 @@ class JoystickControlModule(mp_module.MPModule):
         self.control_active = False
         self._clear_rc_override()
         target_mode = self.prev_mode if self.prev_mode else "LOITER"
-        success = self._set_flight_mode(target_mode)
-        if not success:
-            self._log(f"Failed to revert to {target_mode}. Attempting fallback to LOITER.", error=True)
-            success = self._set_flight_mode("LOITER")
-            target_mode = "LOITER" if success else target_mode
-            if not success:
-                self._log("Fallback to LOITER failed. Attempting fallback to STABILIZE.", error=True)
-                success = self._set_flight_mode("STABILIZE")
-                target_mode = "STABILIZE" if success else target_mode
-        if success:
-            self._log(f"Trigger released → Joystick control disabled, switched to {target_mode} mode")
-        else:
-            self._log("Trigger released → Joystick control disabled. WARNING: Failed to change flight mode!", error=True)
+        plan = [
+            {
+                "mode": target_mode,
+                "success_msg": f"Trigger released → Joystick control disabled, switched to {target_mode} mode",
+                "pending_msg": f"Trigger released → Requested {target_mode} mode; awaiting confirmation.",
+                "failure_msg": f"Failed to revert to {target_mode}. Attempting fallback to LOITER.",
+            },
+            {
+                "mode": "LOITER",
+                "success_msg": "Trigger released → Joystick control disabled, switched to LOITER mode",
+                "pending_msg": "Trigger released → Requested LOITER mode; awaiting confirmation.",
+                "failure_msg": "Fallback to LOITER failed. Attempting fallback to STABILIZE.",
+            },
+            {
+                "mode": "STABILIZE",
+                "success_msg": "Trigger released → Joystick control disabled, switched to STABILIZE mode",
+                "pending_msg": "Trigger released → Requested STABILIZE mode; awaiting confirmation.",
+                "failure_msg": "Trigger released → Joystick control disabled. WARNING: Failed to change flight mode!",
+            },
+        ]
+        self._attempt_mode_sequence(plan)
 
     def _handle_disconnection(self):
         """Handle joystick disconnection by clearing control and switching to safe mode."""
@@ -262,8 +285,12 @@ class JoystickControlModule(mp_module.MPModule):
         if self.control_active:
             self.control_active = False
             self._clear_rc_override()
-            self._log("Joystick was active. Switching to LOITER for safety.")
-            self._set_flight_mode("LOITER")
+            self._set_flight_mode(
+                "LOITER",
+                success_msg="Joystick was active. Switching to LOITER for safety.",
+                pending_msg="Joystick was active. Requested LOITER mode for safety; awaiting confirmation.",
+                failure_msg="Joystick was active but failed to switch to LOITER for safety.",
+            )
         self.joystick = None
         self.joy_id = None
 
@@ -360,63 +387,144 @@ class JoystickControlModule(mp_module.MPModule):
             except Exception as e:
                 self._log(f"ERROR clearing RC override: {e}", error=True)
 
-    def _set_flight_mode(self, mode_name):
-        """
-        Change flight mode to the specified mode (e.g. "GUIDED", "LOITER").
-        Returns True if successful.
-        """
+    def _clone_mode_plan(self, plan):
+        return [
+            {
+                "mode": entry.get("mode"),
+                "success_msg": entry.get("success_msg"),
+                "pending_msg": entry.get("pending_msg"),
+                "failure_msg": entry.get("failure_msg"),
+            }
+            for entry in (plan or [])
+            if entry.get("mode")
+        ]
+
+    def _attempt_mode_sequence(self, plan):
+        plan_copy = self._clone_mode_plan(plan)
+        if not plan_copy:
+            return False
+        first = plan_copy.pop(0)
+        return self._set_flight_mode(
+            first["mode"],
+            success_msg=first.get("success_msg"),
+            pending_msg=first.get("pending_msg"),
+            failure_msg=first.get("failure_msg"),
+            fallback_plan=plan_copy,
+        )
+
+    def _start_next_mode_from_plan(self, plan, previous_failure_msg=None):
+        if previous_failure_msg:
+            self._log(previous_failure_msg, error=True)
+        if not plan:
+            return False
+        next_entry = plan[0]
+        remaining = self._clone_mode_plan(plan[1:])
+        return self._set_flight_mode(
+            next_entry.get("mode"),
+            success_msg=next_entry.get("success_msg"),
+            pending_msg=next_entry.get("pending_msg"),
+            failure_msg=next_entry.get("failure_msg"),
+            fallback_plan=remaining,
+        )
+
+    def _clear_pending_mode_change(self):
+        self._pending_mode_change = None
+        self._pending_mode_success = None
+        self._pending_mode_failure = None
+        self._pending_mode_plan = []
+
+    def _set_flight_mode(self, mode_name, *, success_msg=None, pending_msg=None, failure_msg=None, fallback_plan=None):
+        """Request a flight mode change without blocking the event loop."""
         if not mode_name:
+            if failure_msg:
+                self._log(failure_msg, error=True)
             return False
         mode_name = mode_name.upper()
         try:
             mode_mapping = self.master.mode_mapping()
         except Exception as e:
             self._log(f"Unable to retrieve mode mapping: {e}", error=True)
+            if failure_msg:
+                self._log(failure_msg, error=True)
             return False
         if mode_mapping is None or mode_name not in mode_mapping:
             self._log(f"Flight mode '{mode_name}' not recognized or not supported", error=True)
+            if failure_msg:
+                self._log(failure_msg, error=True)
             return False
         mode_id = mode_mapping[mode_name]
+        current_mode = (self.status.flightmode or "").upper()
+        if current_mode == mode_name:
+            if success_msg:
+                self._log(success_msg)
+            self._clear_pending_mode_change()
+            return True
+        fallback_plan = self._clone_mode_plan(fallback_plan)
         try:
             self.master.set_mode(mode_id)
         except Exception as e:
             self._log(f"Failed to send mode change to {mode_name}: {e}", error=True)
-            return False
-        timeout = time.time() + 5.0
-        while time.time() < timeout:
-            current_mode = (self.status.flightmode or "").upper()
-            if current_mode == mode_name:
-                return True
-            time.sleep(0.1)
-        self._log(f"Timed out waiting for confirmation of mode change to {mode_name}", error=True)
-        return False
+            return self._start_next_mode_from_plan(fallback_plan, failure_msg)
+        self._pending_mode_change = {
+            "mode": mode_name,
+            "deadline": time.time() + 5.0,
+        }
+        self._pending_mode_success = success_msg
+        self._pending_mode_failure = failure_msg
+        self._pending_mode_plan = fallback_plan
+        if pending_msg:
+            self._log(pending_msg)
+        return None
+
+    def _check_pending_mode_change(self):
+        if not self._pending_mode_change:
+            return
+        target = self._pending_mode_change.get("mode")
+        current_mode = (self.status.flightmode or "").upper()
+        if current_mode == target:
+            if self._pending_mode_success:
+                self._log(self._pending_mode_success)
+            else:
+                self._log(f"Flight mode change to {target} confirmed.")
+            self._clear_pending_mode_change()
+            return
+        if time.time() < self._pending_mode_change.get("deadline", 0):
+            return
+        failure_msg = self._pending_mode_failure or f"Timed out waiting for confirmation of mode change to {target}"
+        plan = self._pending_mode_plan
+        self._clear_pending_mode_change()
+        if plan:
+            self._start_next_mode_from_plan(plan, failure_msg)
+        else:
+            self._log(failure_msg, error=True)
 
     def _disarm_vehicle(self):
-        """Send disarm command to the vehicle."""
-        def wait_for_ack():
-            if not hasattr(self.master, "recv_match"):
-                return True
-            deadline = time.time() + 2.0
-            while time.time() < deadline:
-                msg = self.master.recv_match(type='COMMAND_ACK', blocking=True, timeout=0.5)
-                if msg is None:
-                    continue
-                if getattr(msg, 'command', None) == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
-                    result = getattr(msg, 'result', None)
-                    if result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-                        return True
-                    self._log(f"Disarm command rejected with MAV_RESULT {result}", error=True)
-                    return False
-            self._log("No acknowledgement received for disarm command", error=True)
-            return False
+        """Send disarm command to the vehicle without blocking the event loop."""
+        if self._pending_disarm_ack:
+            self._log("Disarm command already in progress; awaiting acknowledgement.")
+            return
+        if self._send_primary_disarm():
+            self._pending_disarm_ack = {
+                "stage": "primary",
+                "deadline": time.time() + 2.0,
+            }
+        else:
+            if self._send_fallback_disarm():
+                self._log("Primary disarm command failed; issued fallback disarm command.", error=True)
+                self._pending_disarm_ack = {
+                    "stage": "fallback",
+                    "deadline": time.time() + 2.0,
+                }
 
+    def _send_primary_disarm(self):
         try:
             self.master.arducopter_disarm()
-            if wait_for_ack():
-                return
-            self._log("Primary disarm command sent but not acknowledged; attempting fallback.", error=True)
+            return True
         except Exception as e:
             self._log(f"Primary disarm command failed: {e}", error=True)
+            return False
+
+    def _send_fallback_disarm(self):
         try:
             self.master.mav.command_long_send(
                 self.master.target_system,
@@ -425,10 +533,49 @@ class JoystickControlModule(mp_module.MPModule):
                 0,
                 0, 0, 0, 0, 0, 0, 0
             )
-            if not wait_for_ack():
-                self._log("Fallback disarm command did not receive acknowledgement.", error=True)
-        except Exception as e2:
-            self._log(f"ERROR: Disarm command failed: {e2}", error=True)
+            return True
+        except Exception as e:
+            self._log(f"ERROR: Disarm command failed: {e}", error=True)
+            return False
+
+    def _process_disarm_ack(self):
+        pending = self._pending_disarm_ack
+        if not pending:
+            return
+        if time.time() <= pending.get("deadline", 0):
+            return
+        if pending.get("stage") == "primary":
+            self._log("Primary disarm command sent but not acknowledged; attempting fallback.", error=True)
+            if self._send_fallback_disarm():
+                self._pending_disarm_ack = {
+                    "stage": "fallback",
+                    "deadline": time.time() + 2.0,
+                }
+            else:
+                self._pending_disarm_ack = None
+        else:
+            self._log("Fallback disarm command did not receive acknowledgement.", error=True)
+            self._pending_disarm_ack = None
+
+    def mavlink_packet(self, msg):
+        msg_type = msg.get_type()
+        if msg_type == "COMMAND_ACK":
+            self._handle_command_ack(msg)
+        elif msg_type == "HEARTBEAT":
+            self._check_pending_mode_change()
+
+    def _handle_command_ack(self, msg):
+        if getattr(msg, "command", None) != mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+            return
+        pending = self._pending_disarm_ack
+        if not pending:
+            return
+        result = getattr(msg, "result", None)
+        if result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            self._log("Disarm command acknowledged by vehicle.")
+        else:
+            self._log(f"Disarm command rejected with MAV_RESULT {result}", error=True)
+        self._pending_disarm_ack = None
 
     def _log(self, message, error=False):
         """
