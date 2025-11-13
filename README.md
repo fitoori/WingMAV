@@ -22,17 +22,51 @@ Logging:
     - By default, log messages are printed to the MAVProxy console.
     - Set LOG_TO_FILE = True and adjust LOG_FILE_PATH to enable file logging.
     
-### 1.	Place the file in your MAVProxy modules folder (e.g. ~/.mavproxy/modules)
-mkdir -p ~/.mavproxy/modules
-cp mavproxy_wingmav.py ~/.mavproxy/modules/
-chmod +x ~/.mavproxy/modules/mavproxy_wingmav.py
+## Automated installation
 
+An installation helper is provided to deploy the module, install system
+dependencies and perform common environment checks.
 
-### 2.	Test by starting MAVProxy:
-  mavproxy.py --master=udp:127.0.0.1:14550 --load-module=rc,wingmav
+```bash
+./install.sh
+```
 
-### 3.	Auto-load on startup:
-#### Add the following line to your ~/.mavinit.rc file:
+The installer acts as a guided wizard: it summarises the detected
+environment, prompts before making changes, and reports the commands it
+executes.  Answer the prompts to control each action, or run in
+non-interactive mode with `-y/--yes` (and optionally `--non-interactive`).
 
+By default the wizard will:
+
+1. Detect or create a MAVProxy modules directory and install
+   `mavproxy_wingmav.py` there.
+2. Install system prerequisites (`python3`, `python3-pip`, `joystick`,
+   etc.) via `apt` when available.
+3. Offer to install missing Python packages (`mavproxy`, `pymavlink`,
+   `pygame`) via `pip`, automatically using `--user` or
+   `--break-system-packages` when required.
+4. Copy the optional `wingmav-proxy` helper launcher into
+   `/usr/local/bin` (or `~/.local/bin` when sudo is not used).
+5. Add the invoking user to the `dialout` group to ensure serial
+   permissions.
+6. Run verification checks (Python imports and `mavproxy.py --version`).
+
+Useful flags:
+
+```
+./install.sh --dry-run                 # Preview the actions without modifying the system
+./install.sh -y --skip-apt             # Accept defaults but skip apt installs
+./install.sh --module-dir ~/mav/modules
+```
+
+See `./install.sh --help` for the full list of options, including ways to
+skip specific steps if you have already configured part of the system.
+
+After the installer finishes, you can start MAVProxy with the WingMAV
+module using `mavproxy.py --load-module=rc,wingmav`, or add the
+following to your `~/.mavinit.rc` file to load it automatically:
+
+```
 module load wingmav
 module load rc
+```
