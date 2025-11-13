@@ -33,7 +33,12 @@ Date: March 5, 2025
 """
 
 import time
-import pygame
+
+try:
+    import pygame  # type: ignore
+except ImportError:  # pragma: no cover - pygame optional for external integrations
+    pygame = None
+
 from pymavlink import mavutil
 from MAVProxy.modules.lib import mp_module
 
@@ -53,14 +58,31 @@ BTN_RTL     = 5   # Button to command RTL (Return-to-Launch)
 BTN_DISARM  = 6   # Button to disarm the vehicle
 
 class JoystickControlModule(mp_module.MPModule):
-    def __init__(self, mpstate):
+    def __init__(
+        self,
+        mpstate,
+        *,
+        log_to_file=None,
+        log_file_path=None,
+        init_pygame=True,
+        auto_connect=True,
+        pygame_module=None,
+    ):
         """
         Initialize the joystick control module.
-        Sets up pygame for joystick handling and prepares RC override.
+
+        Parameters allow external callers to customise integration:
+        - ``log_to_file`` / ``log_file_path``: override default logging configuration.
+        - ``init_pygame``: delay pygame setup when running in a headless test harness.
+        - ``auto_connect``: defer joystick discovery until requested explicitly.
+        - ``pygame_module``: inject a pygame-compatible shim for unit testing.
         """
         super(JoystickControlModule, self).__init__(mpstate, "joystickctrl", "Joystick control module")
         # Use instance variable for logging configuration
-        self.log_enabled = LOG_TO_FILE
+        if log_to_file is None:
+            log_to_file = LOG_TO_FILE
+        self.log_enabled = bool(log_to_file)
+        self.log_file_path = log_file_path or LOG_FILE_PATH
         self.log_file = None
 
         # State variables
@@ -70,27 +92,28 @@ class JoystickControlModule(mp_module.MPModule):
         self.center_offsets = [0.0, 0.0, 0.0]  # Neutral offsets for roll, pitch, yaw
         self.prev_mode = None         # Flight mode prior to entering GUIDED
         self.last_override_time = 0   # Timestamp of last RC override send
+        self._last_joystick_retry = 0
+        self._pygame_ready = False
+        self._auto_connect = auto_connect
+        self._pg = pygame_module if pygame_module is not None else pygame
 
         # Initialize logging if enabled
         if self.log_enabled:
             try:
-                self.log_file = open(LOG_FILE_PATH, "a")
+                self.log_file = open(self.log_file_path, "a")
                 self._log("Joystick control module started (file logging enabled).")
             except Exception as e:
-                print(f"JoystickCtrl: ERROR opening log file {LOG_FILE_PATH}: {e}")
+                print(f"JoystickCtrl: ERROR opening log file {self.log_file_path}: {e}")
                 self.log_file = None
                 self.log_enabled = False
 
         # Initialize pygame joystick subsystem
-        try:
-            pygame.init()
-            pygame.joystick.init()
-        except Exception as e:
-            self._log(f"Failed to initialize pygame joystick system: {e}", error=True)
-            return
+        if init_pygame:
+            self._initialize_pygame()
 
         # Attempt to connect to a joystick device
-        self._connect_joystick()
+        if self._pygame_ready and self._auto_connect:
+            self._connect_joystick()
 
         # Check for RC override module
         self.rc_module = self.module('rc')
@@ -99,14 +122,46 @@ class JoystickControlModule(mp_module.MPModule):
         else:
             self._clear_rc_override()
 
+    def _initialize_pygame(self):
+        """Initialise pygame's joystick subsystem, raising if unavailable."""
+        if self._pg is None:
+            raise ImportError(
+                "pygame is not available. Install pygame or instantiate JoystickControlModule "
+                "with init_pygame=False and provide a compatible event source."
+            )
+        try:
+            self._pg.init()
+            self._pg.joystick.init()
+            self._pygame_ready = True
+        except Exception as e:
+            self._log(f"Failed to initialize pygame joystick system: {e}", error=True)
+            self._pygame_ready = False
+            if self.log_enabled and self.log_file:
+                try:
+                    self.log_file.close()
+                finally:
+                    self.log_file = None
+                    self.log_enabled = False
+            raise
+
+    def ensure_pygame_ready(self):
+        """Ensure pygame has been initialised. Intended for external callers."""
+        if not self._pygame_ready:
+            self._initialize_pygame()
+        if self._pygame_ready and self._auto_connect and self.joystick is None:
+            self._connect_joystick()
+
     def _connect_joystick(self):
         """Connect to the first available joystick."""
-        count = pygame.joystick.get_count()
+        if not self._pygame_ready or self._pg is None:
+            return False
+        self._last_joystick_retry = time.time()
+        count = self._pg.joystick.get_count()
         if count < 1:
             self._log("No joystick detected. Waiting for a joystick connection.")
             return False
         try:
-            js = pygame.joystick.Joystick(0)
+            js = self._pg.joystick.Joystick(0)
             js.init()
             self.joystick = js
             self.joy_id = js.get_id()
@@ -127,10 +182,11 @@ class JoystickControlModule(mp_module.MPModule):
         This method is called frequently by MAVProxy.
         """
         # Handle events (button presses, axis movements, connection changes)
-        for event in pygame.event.get():
-            if self.joystick is None:
-                continue
-            if event.type == pygame.JOYBUTTONDOWN and event.joy == self.joy_id:
+        if not self._pygame_ready or self._pg is None:
+            return
+
+        for event in self._pg.event.get():
+            if event.type == self._pg.JOYBUTTONDOWN and self.joystick and event.joy == self.joy_id:
                 if event.button == BTN_TRIGGER:
                     if not self.control_active:
                         self._activate_control()
@@ -140,20 +196,24 @@ class JoystickControlModule(mp_module.MPModule):
                 elif event.button == BTN_DISARM:
                     self._log("Disarm button pressed → Disarming the vehicle")
                     self._disarm_vehicle()
-            elif event.type == pygame.JOYBUTTONUP and event.joy == self.joy_id:
+            elif event.type == self._pg.JOYBUTTONUP and self.joystick and event.joy == self.joy_id:
                 if event.button == BTN_TRIGGER:
                     if self.control_active:
                         self._deactivate_control()
-            elif event.type == pygame.JOYAXISMOTION and event.joy == self.joy_id:
+            elif event.type == self._pg.JOYAXISMOTION and self.joystick and event.joy == self.joy_id:
                 if self.control_active:
                     self._send_override()
-            elif event.type == pygame.JOYDEVICEADDED:
+            elif event.type == self._pg.JOYDEVICEADDED:
                 if self.joystick is None:
                     self._log("Joystick device added. Attempting to initialize.")
                     self._connect_joystick()
-            elif event.type == pygame.JOYDEVICEREMOVED:
+            elif event.type == self._pg.JOYDEVICEREMOVED:
                 if self.joystick and event.joy == self.joy_id:
                     self._handle_disconnection()
+
+        if self.joystick is None and time.time() - self._last_joystick_retry > 2.0:
+            self._last_joystick_retry = time.time()
+            self._connect_joystick()
 
         # If no rc module, throttle direct override sending to ~10 Hz
         if self.control_active and self.rc_module is None:
@@ -242,12 +302,22 @@ class JoystickControlModule(mp_module.MPModule):
                 return
         self._last_pwm_values = pwm_values
         if self.rc_module:
-            override_list = list(self.rc_module.override)
+            override_source = self.rc_module.override
+            if override_source is None:
+                override_list = [0] * 8
+            else:
+                override_list = list(override_source)
+            if len(override_list) < 8:
+                override_list.extend([0] * (8 - len(override_list)))
             override_list[0] = roll_pwm
             override_list[1] = pitch_pwm
             override_list[2] = throttle_pwm
             override_list[3] = yaw_pwm
-            self.rc_module.override = override_list
+            try:
+                self.rc_module.override = override_list
+            except Exception as e:
+                self._log(f"Failed to apply RC override via rc module: {e}", error=True)
+                return
             if hasattr(self.rc_module, "override_period"):
                 self.rc_module.override_period.force()
         else:
@@ -262,12 +332,22 @@ class JoystickControlModule(mp_module.MPModule):
     def _clear_rc_override(self):
         """Clear any RC override by setting channels 1-4 to 0 (no override)."""
         if self.rc_module:
-            override_list = list(self.rc_module.override)
+            override_source = self.rc_module.override
+            if override_source is None:
+                override_list = [0] * 8
+            else:
+                override_list = list(override_source)
+            if len(override_list) < 8:
+                override_list.extend([0] * (8 - len(override_list)))
             override_list[0] = 0
             override_list[1] = 0
             override_list[2] = 0
             override_list[3] = 0
-            self.rc_module.override = override_list
+            try:
+                self.rc_module.override = override_list
+            except Exception as e:
+                self._log(f"Failed to clear RC override via rc module: {e}", error=True)
+                return
             if hasattr(self.rc_module, "override_period"):
                 self.rc_module.override_period.force()
         else:
@@ -288,33 +368,67 @@ class JoystickControlModule(mp_module.MPModule):
         if not mode_name:
             return False
         mode_name = mode_name.upper()
-        mode_mapping = self.master.mode_mapping()
+        try:
+            mode_mapping = self.master.mode_mapping()
+        except Exception as e:
+            self._log(f"Unable to retrieve mode mapping: {e}", error=True)
+            return False
         if mode_mapping is None or mode_name not in mode_mapping:
             self._log(f"Flight mode '{mode_name}' not recognized or not supported", error=True)
             return False
         mode_id = mode_mapping[mode_name]
         try:
             self.master.set_mode(mode_id)
-            return True
         except Exception as e:
             self._log(f"Failed to send mode change to {mode_name}: {e}", error=True)
             return False
+        timeout = time.time() + 5.0
+        while time.time() < timeout:
+            current_mode = (self.status.flightmode or "").upper()
+            if current_mode == mode_name:
+                return True
+            time.sleep(0.1)
+        self._log(f"Timed out waiting for confirmation of mode change to {mode_name}", error=True)
+        return False
 
     def _disarm_vehicle(self):
         """Send disarm command to the vehicle."""
+        def wait_for_ack():
+            if not hasattr(self.master, "recv_match"):
+                return True
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                msg = self.master.recv_match(type='COMMAND_ACK', blocking=True, timeout=0.5)
+                if msg is None:
+                    continue
+                if getattr(msg, 'command', None) == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+                    result = getattr(msg, 'result', None)
+                    if result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                        return True
+                    self._log(f"Disarm command rejected with MAV_RESULT {result}", error=True)
+                    return False
+            self._log("No acknowledgement received for disarm command", error=True)
+            return False
+
         try:
             self.master.arducopter_disarm()
+            if wait_for_ack():
+                return
+            self._log("Primary disarm command sent but not acknowledged; attempting fallback.", error=True)
         except Exception as e:
-            try:
-                self.master.mav.command_long_send(
-                    self.master.target_system,
-                    self.master.target_component,
-                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-                    0,
-                    0, 0, 0, 0, 0, 0, 0
-                )
-            except Exception as e2:
-                self._log(f"ERROR: Disarm command failed: {e2}", error=True)
+            self._log(f"Primary disarm command failed: {e}", error=True)
+        try:
+            self.master.mav.command_long_send(
+                self.master.target_system,
+                self.master.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                0,
+                0, 0, 0, 0, 0, 0, 0
+            )
+            if not wait_for_ack():
+                self._log("Fallback disarm command did not receive acknowledgement.", error=True)
+        except Exception as e2:
+            self._log(f"ERROR: Disarm command failed: {e2}", error=True)
 
     def _log(self, message, error=False):
         """
@@ -343,9 +457,14 @@ class JoystickControlModule(mp_module.MPModule):
                 self.joystick.quit()
             except Exception:
                 pass
-        if self.log_enabled and self.log_file:
-            self.log_file.close()
         self._log("Joystick control module unloaded.")
+        if self.log_enabled and self.log_file:
+            try:
+                self.log_file.close()
+            finally:
+                self.log_file = None
+                self.log_enabled = False
 
-def init(mpstate):
-    return JoystickControlModule(mpstate)
+def init(mpstate, **kwargs):
+    """Factory used by MAVProxy and external callers to construct the module."""
+    return JoystickControlModule(mpstate, **kwargs)
