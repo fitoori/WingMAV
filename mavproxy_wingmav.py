@@ -435,23 +435,18 @@ class JoystickControlModule(mp_module.MPModule):
 
     def _set_flight_mode(self, mode_name, *, success_msg=None, pending_msg=None, failure_msg=None, fallback_plan=None):
         """Request a flight mode change without blocking the event loop."""
+        fallback_plan = self._clone_mode_plan(fallback_plan)
         if not mode_name:
-            if failure_msg:
-                self._log(failure_msg, error=True)
-            return False
+            return self._start_next_mode_from_plan(fallback_plan, failure_msg)
         mode_name = mode_name.upper()
         try:
             mode_mapping = self.master.mode_mapping()
         except Exception as e:
             self._log(f"Unable to retrieve mode mapping: {e}", error=True)
-            if failure_msg:
-                self._log(failure_msg, error=True)
-            return False
+            return self._start_next_mode_from_plan(fallback_plan, failure_msg)
         if mode_mapping is None or mode_name not in mode_mapping:
             self._log(f"Flight mode '{mode_name}' not recognized or not supported", error=True)
-            if failure_msg:
-                self._log(failure_msg, error=True)
-            return False
+            return self._start_next_mode_from_plan(fallback_plan, failure_msg)
         mode_id = mode_mapping[mode_name]
         current_mode = (self.status.flightmode or "").upper()
         if current_mode == mode_name:
@@ -459,7 +454,6 @@ class JoystickControlModule(mp_module.MPModule):
                 self._log(success_msg)
             self._clear_pending_mode_change()
             return True
-        fallback_plan = self._clone_mode_plan(fallback_plan)
         try:
             self.master.set_mode(mode_id)
         except Exception as e:
@@ -573,9 +567,23 @@ class JoystickControlModule(mp_module.MPModule):
         result = getattr(msg, "result", None)
         if result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
             self._log("Disarm command acknowledged by vehicle.")
+            self._pending_disarm_ack = None
+            return
+        self._log(f"Disarm command rejected with MAV_RESULT {result}", error=True)
+        if pending.get("stage") == "primary":
+            if self._send_fallback_disarm():
+                self._log(
+                    "Primary disarm command rejected; issued fallback disarm command.",
+                    error=True,
+                )
+                self._pending_disarm_ack = {
+                    "stage": "fallback",
+                    "deadline": time.time() + 2.0,
+                }
+            else:
+                self._pending_disarm_ack = None
         else:
-            self._log(f"Disarm command rejected with MAV_RESULT {result}", error=True)
-        self._pending_disarm_ack = None
+            self._pending_disarm_ack = None
 
     def _log(self, message, error=False):
         """
