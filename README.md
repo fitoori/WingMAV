@@ -36,3 +36,19 @@ chmod +x ~/.mavproxy/modules/mavproxy_wingmav.py
 
 module load wingmav
 module load rc
+
+## Diagnostic pre-flight check
+
+Run `diagnostic_wingmav.py` to verify joystick detection, inspect your MAVProxy
+installation, and simulate the MAVLink commands that the WingMAV module will
+issue during flight. This helps confirm that buttons and axes are mapped as
+expected before connecting to a real vehicle.
+
+```bash
+python diagnostic_wingmav.py --list-only        # inventory available joysticks
+python diagnostic_wingmav.py --device-index=0   # interactive test loop
+```
+
+Use `--mavlink-endpoint` (for example, `udpout:127.0.0.1:14550`) if you want
+the diagnostic session to talk to a live autopilot instead of simulating the
+MAVLink output.
