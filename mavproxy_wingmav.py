@@ -450,16 +450,17 @@ class JoystickControlModule(mp_module.MPModule):
         mode_name = mode_name.upper()
 
         existing = self._pending_mode_change
+        existing_mode = None
+        cancelled_pending_msg = None
         if existing:
-            pending_mode = existing.get("mode")
-            if pending_mode == mode_name:
+            existing_mode = existing.get("mode")
+            if existing_mode == mode_name:
                 if pending_msg:
                     self._log(pending_msg)
                 return None
-            self._log(
-                f"Cancelling pending flight mode change to {pending_mode}; requesting {mode_name} instead."
+            cancelled_pending_msg = (
+                f"Cancelling pending flight mode change to {existing_mode}; requesting {mode_name} instead."
             )
-            self._clear_pending_mode_change()
 
         try:
             mode_mapping = self.master.mode_mapping()
@@ -485,7 +486,17 @@ class JoystickControlModule(mp_module.MPModule):
             self.master.set_mode(mode_id)
         except Exception as e:
             self._log(f"Failed to send mode change to {mode_name}: {e}", error=True)
+            if existing:
+                self._log(
+                    "Continuing to monitor previously pending flight mode change"
+                    + (f" to {existing_mode}" if existing_mode else "")
+                    + ".",
+                )
+                return False
             return self._start_next_mode_from_plan(fallback_plan, failure_msg)
+        if cancelled_pending_msg:
+            self._log(cancelled_pending_msg)
+            self._clear_pending_mode_change()
         self._pending_mode_change = {
             "mode": mode_name,
             "deadline": time.time() + 5.0,
