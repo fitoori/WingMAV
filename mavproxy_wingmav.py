@@ -186,6 +186,10 @@ class JoystickControlModule(mp_module.MPModule):
         Process joystick events and send RC override messages.
         This method is called frequently by MAVProxy.
         """
+        # Always service asynchronous state machines first so pending mode/disarm
+        # transitions continue even if pygame is unavailable.
+        self._service_async_transitions()
+
         # Handle events (button presses, axis movements, connection changes)
         if not self._pygame_ready or self._pg is None:
             return
@@ -230,6 +234,10 @@ class JoystickControlModule(mp_module.MPModule):
             if time.time() - self.last_override_time > 0.1:
                 self._send_override()
 
+        # Run async transitions again in case the work above queued new requests.
+        self._service_async_transitions()
+
+    def _service_async_transitions(self):
         self._check_pending_mode_change()
         self._process_disarm_ack()
 
@@ -440,6 +448,19 @@ class JoystickControlModule(mp_module.MPModule):
                 self._log(failure_msg, error=True)
             return False
         mode_name = mode_name.upper()
+
+        existing = self._pending_mode_change
+        if existing:
+            pending_mode = existing.get("mode")
+            if pending_mode == mode_name:
+                if pending_msg:
+                    self._log(pending_msg)
+                return None
+            self._log(
+                f"Cancelling pending flight mode change to {pending_mode}; requesting {mode_name} instead."
+            )
+            self._clear_pending_mode_change()
+
         try:
             mode_mapping = self.master.mode_mapping()
         except Exception as e:
