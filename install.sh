@@ -54,6 +54,8 @@ SKIP_CHECKS=false
 NON_INTERACTIVE=false
 MODULE_DIR_OVERRIDE=""
 RUNNER_TARGET_OVERRIDE=""
+SUDO=""
+PRIVILEGE_AVAILABLE=false
 
 CAN_PROMPT=true
 if [[ ! -t 0 ]]; then
@@ -204,15 +206,29 @@ verify_repository_contents() {
 init_privilege_helper() {
     if [[ $EUID -eq 0 ]]; then
         SUDO=""
+        PRIVILEGE_AVAILABLE=true
         return
     fi
 
     if command_exists sudo; then
         SUDO="sudo"
+        PRIVILEGE_AVAILABLE=true
     else
-        error "This script requires root privileges for some operations. Install sudo or run as root."
-        exit 1
+        SUDO=""
+        PRIVILEGE_AVAILABLE=false
+        warn "sudo not found; privileged operations that require root will be unavailable."
     fi
+}
+
+require_privilege() {
+    local action=${1:-"This action"}
+    if $PRIVILEGE_AVAILABLE; then
+        return 0
+    fi
+
+    error "$action requires root privileges, but sudo is not available and the installer is not running as root."
+    error "Re-run the installer with elevated permissions or skip this step using the provided flags."
+    exit 1
 }
 
 ensure_directory() {
@@ -221,11 +237,23 @@ ensure_directory() {
         return
     fi
     info "Creating directory $dir"
-    if [[ -n ${SUDO:-} ]]; then
-        run_cmd "$SUDO" mkdir -p "$dir"
-    else
-        run_cmd mkdir -p "$dir"
+    if run_cmd mkdir -p "$dir"; then
+        return
     fi
+
+    if [[ -n ${SUDO:-} ]]; then
+        info "Retrying directory creation with sudo"
+        if run_cmd "$SUDO" mkdir -p "$dir"; then
+            return
+        fi
+    fi
+
+    if ! $PRIVILEGE_AVAILABLE; then
+        error "Failed to create directory $dir (permission denied). Choose a writable location or re-run with sudo."
+    else
+        error "Failed to create directory $dir."
+    fi
+    exit 1
 }
 
 ensure_apt_dependencies() {
@@ -257,6 +285,8 @@ ensure_apt_dependencies() {
         warn "Skipping apt package installation."
         return
     fi
+
+    require_privilege "APT package installation"
 
     info "Updating apt package lists"
     if [[ -n ${SUDO:-} ]]; then
@@ -462,11 +492,23 @@ install_wingmav_module() {
     info "Installing WingMAV module to $target_file"
     ensure_directory "$target_dir"
     local src="$REPO_ROOT/$MODULE_NAME"
-    if [[ -n ${SUDO:-} ]]; then
-        run_cmd "$SUDO" install -Dm644 "$src" "$target_file"
-    else
-        run_cmd install -Dm644 "$src" "$target_file"
+    if run_cmd install -Dm644 "$src" "$target_file"; then
+        return
     fi
+
+    if [[ -n ${SUDO:-} ]]; then
+        info "Retrying module installation with sudo"
+        if run_cmd "$SUDO" install -Dm644 "$src" "$target_file"; then
+            return
+        fi
+    fi
+
+    if ! $PRIVILEGE_AVAILABLE; then
+        error "Failed to install WingMAV module to $target_file. Choose a writable directory or re-run with sudo."
+    else
+        error "Failed to install WingMAV module to $target_file."
+    fi
+    exit 1
 }
 
 select_runner_target() {
@@ -506,10 +548,27 @@ install_runner_script() {
 
     info "Installing wingmav-proxy helper to $target"
     local src="$REPO_ROOT/$RUNNER_NAME"
-    if [[ -n ${SUDO:-} ]]; then
-        run_cmd "$SUDO" install -Dm755 "$src" "$target"
+    if run_cmd install -Dm755 "$src" "$target"; then
+        :
+    elif [[ -n ${SUDO:-} ]]; then
+        info "Retrying runner installation with sudo"
+        if run_cmd "$SUDO" install -Dm755 "$src" "$target"; then
+            :
+        else
+            if ! $PRIVILEGE_AVAILABLE; then
+                error "Failed to install wingmav-proxy to $target. Choose a writable location or re-run with sudo."
+            else
+                error "Failed to install wingmav-proxy to $target."
+            fi
+            exit 1
+        fi
     else
-        run_cmd install -Dm755 "$src" "$target"
+        if ! $PRIVILEGE_AVAILABLE; then
+            error "Failed to install wingmav-proxy to $target. Choose a writable location or re-run with sudo."
+        else
+            error "Failed to install wingmav-proxy to $target."
+        fi
+        exit 1
     fi
 
     if [[ $target == "$HOME/.local/bin"/* ]]; then
@@ -537,6 +596,11 @@ configure_dialout_group() {
 
     if ! prompt_yes_no "Add user '$target_user' to the dialout group?" "Y"; then
         warn "Dialout group update skipped. Serial devices may be inaccessible."
+        return
+    fi
+
+    if ! $PRIVILEGE_AVAILABLE; then
+        warn "Cannot modify group memberships without root privileges; skipping dialout group configuration."
         return
     fi
 
