@@ -457,6 +457,19 @@ pip_install_packages() {
 detect_missing_python_packages() {
     "$PYTHON_BIN" - <<'PY'
 import importlib
+import contextlib
+import io
+
+
+def import_silently(name: str):
+    """Import ``name`` while swallowing noisy stdout/stderr."""
+
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+        io.StringIO()
+    ):
+        return importlib.import_module(name)
+
+
 requirements = {
     "MAVProxy": "mavproxy",
     "pymavlink": "pymavlink",
@@ -464,7 +477,7 @@ requirements = {
 }
 for module, package in requirements.items():
     try:
-        importlib.import_module(module)
+        import_silently(module)
     except Exception:
         print(package)
 PY
@@ -499,6 +512,17 @@ verify_python_environment() {
     if "$PYTHON_BIN" - <<'PY'
 import importlib
 import sys
+import contextlib
+import io
+
+
+def import_silently(name: str):
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+        io.StringIO()
+    ):
+        return importlib.import_module(name)
+
+
 required = {
     "MAVProxy": "MAVProxy or mavproxy",
     "pymavlink": "pymavlink",
@@ -507,7 +531,7 @@ required = {
 missing = []
 for module, package in required.items():
     try:
-        importlib.import_module(module)
+        import_silently(module)
     except Exception as exc:
         missing.append(f"{module} (install via {package}): {exc}")
 if missing:
@@ -717,9 +741,20 @@ run_environment_checks() {
     info "Performing module import smoke test …"
     if "$PYTHON_BIN" - <<'PY'
 import importlib
+import contextlib
+import io
+
+
+def import_silently(name: str):
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+        io.StringIO()
+    ):
+        return importlib.import_module(name)
+
+
 modules = ["MAVProxy.modules.lib.mp_module", "pymavlink", "pygame"]
 for name in modules:
-    importlib.import_module(name)
+    import_silently(name)
 print("All required modules imported successfully.")
 PY
     then
