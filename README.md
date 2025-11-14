@@ -31,6 +31,36 @@ dependencies and perform common environment checks.
 ./install.sh
 ```
 
+The installer acts as a guided wizard: it summarises the detected
+environment, prompts before making changes, and reports the commands it
+executes.  Answer the prompts to control each action, or run in
+non-interactive mode with `-y/--yes` (and optionally `--non-interactive`).
+
+By default the wizard will:
+
+1. Detect or create a MAVProxy modules directory and install
+   `mavproxy_wingmav.py` there.
+2. Install system prerequisites (`python3`, `python3-pip`, `joystick`,
+   etc.) via `apt` when available.
+3. Offer to install missing Python packages (`mavproxy`, `pymavlink`,
+   `pygame`) via `pip`, automatically using `--user` or
+   `--break-system-packages` when required.
+4. Copy the optional `wingmav-proxy` helper launcher into
+   `/usr/local/bin` (or `~/.local/bin` when sudo is not used).
+5. Add the invoking user to the `dialout` group to ensure serial
+   permissions.
+6. Run verification checks (Python imports and `mavproxy.py --version`).
+
+Useful flags:
+
+```
+./install.sh --dry-run                 # Preview the actions without modifying the system
+./install.sh -y --skip-apt             # Accept defaults but skip apt installs
+./install.sh --module-dir ~/mav/modules
+```
+
+See `./install.sh --help` for the full list of options, including ways to
+skip specific steps if you have already configured part of the system.
 The script will:
 
 1. Detect or create a MAVProxy modules directory and install
