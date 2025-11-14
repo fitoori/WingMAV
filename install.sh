@@ -456,16 +456,28 @@ pip_install_packages() {
 
 detect_missing_python_packages() {
     "$PYTHON_BIN" - <<'PY'
+import contextlib
 import importlib
+import io
+
+
+def import_silently(name):
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            importlib.import_module(name)
+    except Exception:
+        return False
+    else:
+        return True
+
+
 requirements = {
     "MAVProxy": "mavproxy",
     "pymavlink": "pymavlink",
     "pygame": "pygame",
 }
 for module, package in requirements.items():
-    try:
-        importlib.import_module(module)
-    except Exception:
+    if not import_silently(module):
         print(package)
 PY
 }
@@ -497,8 +509,22 @@ ensure_python_packages() {
 verify_python_environment() {
     info "Verifying Python environment …"
     if "$PYTHON_BIN" - <<'PY'
+import contextlib
 import importlib
+import io
 import sys
+
+
+def import_silently(name):
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            importlib.import_module(name)
+    except Exception as exc:  # noqa: PERF203 - keep exception for message context
+        return False, exc
+    else:
+        return True, None
+
+
 required = {
     "MAVProxy": "MAVProxy or mavproxy",
     "pymavlink": "pymavlink",
@@ -506,9 +532,8 @@ required = {
 }
 missing = []
 for module, package in required.items():
-    try:
-        importlib.import_module(module)
-    except Exception as exc:
+    ok, exc = import_silently(module)
+    if not ok:
         missing.append(f"{module} (install via {package}): {exc}")
 if missing:
     for message in missing:
@@ -716,10 +741,19 @@ run_environment_checks() {
 
     info "Performing module import smoke test …"
     if "$PYTHON_BIN" - <<'PY'
+import contextlib
 import importlib
+import io
+
+
+def import_silently(name):
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        importlib.import_module(name)
+
+
 modules = ["MAVProxy.modules.lib.mp_module", "pymavlink", "pygame"]
 for name in modules:
-    importlib.import_module(name)
+    import_silently(name)
 print("All required modules imported successfully.")
 PY
     then
