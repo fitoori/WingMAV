@@ -21,6 +21,7 @@ script if desired.
 from __future__ import annotations
 
 import argparse
+import functools
 import os
 import select
 import shlex
@@ -30,6 +31,27 @@ import sys
 import threading
 from pathlib import Path
 from typing import Iterable, List, Optional, TextIO
+
+
+@functools.lru_cache(maxsize=1)
+def _mavproxy_supports_mod_path(executable: str) -> bool:
+    """Return ``True`` when ``mavproxy.py`` accepts the ``--mod-path`` flag."""
+
+    try:
+        result = subprocess.run(
+            [executable, "--help"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except OSError:
+        # If ``mavproxy.py`` cannot be executed we err on the safe side and
+        # assume it does *not* support the option.  The subsequent launch will
+        # fail in a clearer way.
+        return False
+
+    return "--mod-path" in result.stdout
 
 
 def build_mavproxy_command(
@@ -42,7 +64,10 @@ def build_mavproxy_command(
 ) -> List[str]:
     """Construct the command line used to launch MAVProxy."""
 
-    command: List[str] = [executable, f"--master={master}", f"--mod-path={mod_path}"]
+    command: List[str] = [executable, f"--master={master}"]
+
+    if _mavproxy_supports_mod_path(executable):
+        command.append(f"--mod-path={mod_path}")
 
     if baudrate:
         command.append(f"--baud={baudrate}")
@@ -99,6 +124,15 @@ class WingMAVProxyRunner:
         print("  " + " ".join(shlex.quote(part) for part in command))
         sys.stdout.flush()
 
+        env = os.environ.copy()
+        if not _mavproxy_supports_mod_path(self.args.mavproxy):
+            repo_path = str(repo_root)
+            existing_path = env.get("PYTHONPATH")
+            if existing_path:
+                env["PYTHONPATH"] = os.pathsep.join([repo_path, existing_path])
+            else:
+                env["PYTHONPATH"] = repo_path
+
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -106,6 +140,7 @@ class WingMAVProxyRunner:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            env=env,
         )
 
         assert self.process.stdout is not None
