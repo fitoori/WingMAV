@@ -55,6 +55,10 @@ MODULE_DIR_OVERRIDE=""
 RUNNER_TARGET_OVERRIDE=""
 SUDO=""
 PRIVILEGE_AVAILABLE=false
+PIP_INSTALL_MODE=""
+VENV_PATH=""
+PYTHON_BIN="python3"
+PYTHON_CONTEXT_DESC="the system default python3"
 
 CAN_PROMPT=true
 if [[ ! -t 0 ]]; then
@@ -266,7 +270,7 @@ ensure_apt_dependencies() {
         return
     fi
 
-    local packages=(python3 python3-pip python3-venv python3-mavproxy python3-pymavlink python3-pygame joystick)
+    local packages=(python3 python3-pip python3-venv joystick)
     local missing=()
     for pkg in "${packages[@]}"; do
         if ! dpkg -s "$pkg" >/dev/null 2>&1; then
@@ -298,13 +302,106 @@ ensure_apt_dependencies() {
 }
 
 pip_supports_break_system_packages() {
+    local python_cmd=${1:-python3}
     if $DRY_RUN; then
         return 0
     fi
-    if python3 -m pip help install 2>/dev/null | grep -q -- "--break-system-packages"; then
+    if "$python_cmd" -m pip help install 2>/dev/null | grep -q -- "--break-system-packages"; then
         return 0
     fi
     return 1
+}
+
+configure_python_installation() {
+    if [[ -n ${VIRTUAL_ENV:-} ]]; then
+        VENV_PATH=$(expand_path "$VIRTUAL_ENV")
+        PYTHON_BIN="$VENV_PATH/bin/python"
+        PIP_INSTALL_MODE="active-venv"
+        PYTHON_CONTEXT_DESC="the active virtual environment at $VENV_PATH"
+        info "Detected active Python virtual environment at $VENV_PATH"
+        return
+    fi
+
+    if $NON_INTERACTIVE || ! $CAN_PROMPT || $ASSUME_YES; then
+        PIP_INSTALL_MODE="user"
+        PYTHON_CONTEXT_DESC="the user site-packages directory (~/.local)"
+        info "Automated mode; Python packages will be installed for the current user."
+        return
+    fi
+
+    info "Select how WingMAV's Python dependencies should be installed:"
+    echo "  1) Install for the current user (~/.local)"
+    echo "  2) Create or reuse a dedicated virtual environment"
+
+    local allow_system_break=false
+    local prompt_range="[1-2]"
+    if pip_supports_break_system_packages "$PYTHON_BIN"; then
+        echo "  3) Install into the system Python using --break-system-packages"
+        allow_system_break=true
+        prompt_range="[1-3]"
+    else
+        echo "  (System-wide installation with --break-system-packages is unavailable; pip is too old.)"
+    fi
+
+    local choice
+    while true; do
+        read -rp "Enter selection $prompt_range: " choice || choice=""
+        choice=${choice:-1}
+        case $choice in
+            1)
+                PIP_INSTALL_MODE="user"
+                PYTHON_CONTEXT_DESC="the user site-packages directory (~/.local)"
+                break
+                ;;
+            2)
+                local default_venv="$REPO_ROOT/.wingmav-venv"
+                local venv_dir
+                venv_dir=$(prompt_for_path "Virtual environment directory" "$default_venv")
+                venv_dir=$(expand_path "$venv_dir")
+                create_or_use_virtualenv "$venv_dir"
+                PIP_INSTALL_MODE="venv"
+                PYTHON_CONTEXT_DESC="the virtual environment at $VENV_PATH"
+                break
+                ;;
+            3)
+                if ! $allow_system_break; then
+                    echo "Option 3 is not available with the current pip version."
+                    continue
+                fi
+                PIP_INSTALL_MODE="system-break"
+                PYTHON_CONTEXT_DESC="the system Python with --break-system-packages"
+                break
+                ;;
+            *)
+                echo "Please enter 1, 2, or 3."
+                ;;
+        esac
+    done
+}
+
+create_or_use_virtualenv() {
+    local path=$1
+    if [[ -z $path ]]; then
+        error "Virtual environment path cannot be empty."
+        exit 1
+    fi
+
+    if [[ ! -d $path ]]; then
+        info "Creating virtual environment at $path"
+        if ! run_cmd python3 -m venv "$path"; then
+            error "Failed to create virtual environment at $path. Ensure python3-venv is installed."
+            exit 1
+        fi
+    else
+        info "Using existing virtual environment at $path"
+    fi
+
+    VENV_PATH=$path
+    if [[ ! -x "$VENV_PATH/bin/python" ]]; then
+        error "Virtual environment at $VENV_PATH is missing its Python executable."
+        exit 1
+    fi
+    PYTHON_BIN="$VENV_PATH/bin/python"
 }
 
 pip_install_packages() {
@@ -313,59 +410,52 @@ pip_install_packages() {
         return 0
     fi
 
-    local pip_cmd
-    if command_exists pip3; then
-        pip_cmd=(pip3)
-    else
-        pip_cmd=(python3 -m pip)
+    local args=(install --upgrade)
+    local pip_cmd=("$PYTHON_BIN" -m pip)
+    local target_desc="$PYTHON_CONTEXT_DESC"
+    local need_privilege=false
+
+    case $PIP_INSTALL_MODE in
+        active-venv|venv)
+            target_desc="the virtual environment at $VENV_PATH"
+            ;;
+        user|'')
+            args+=(--user)
+            target_desc="the user site-packages directory (~/.local)"
+            ;;
+        system-break)
+            args+=(--break-system-packages)
+            target_desc="the system Python with --break-system-packages"
+            if [[ $EUID -ne 0 ]]; then
+                need_privilege=true
+            fi
+            ;;
+        *)
+            error "Unknown pip installation mode '$PIP_INSTALL_MODE'"
+            exit 1
+            ;;
+    esac
+
+    if [[ $PIP_INSTALL_MODE == "system-break" ]] && ! pip_supports_break_system_packages "$PYTHON_BIN"; then
+        error "pip for $PYTHON_BIN does not support --break-system-packages. Choose a different installation mode."
+        exit 1
     fi
 
-    local args=(install --upgrade)
-    local target_desc
-    local used_break=false
-    local pip_target="user"
-
-    if [[ -n ${VIRTUAL_ENV:-} ]]; then
-        pip_target="venv"
-        target_desc="the active virtual environment"
-    elif [[ $EUID -eq 0 ]]; then
-        pip_target="system"
-        if pip_supports_break_system_packages; then
-            args+=(--break-system-packages)
-            used_break=true
-            target_desc="the system Python (with --break-system-packages)"
-        else
-            target_desc="the system Python"
-        fi
-    else
-        pip_target="user"
-        args+=(--user)
-        target_desc="the user site-packages directory (~/.local)"
+    if $need_privilege; then
+        require_privilege "System Python package installation"
+        pip_cmd=("$SUDO" "$PYTHON_BIN" -m pip)
     fi
 
     info "Installing Python packages (${packages[*]}) into $target_desc"
 
     if ! run_cmd "${pip_cmd[@]}" "${args[@]}" "${packages[@]}"; then
-        if $DRY_RUN; then
-            return 0
-        fi
-
-        if [[ $pip_target != "user" ]] && ! used_break && pip_supports_break_system_packages; then
-            warn "Initial pip install failed; retrying with --break-system-packages"
-            args+=(--break-system-packages)
-            used_break=true
-            if run_cmd "${pip_cmd[@]}" "${args[@]}" "${packages[@]}"; then
-                return 0
-            fi
-        fi
-
         error "Failed to install Python packages via pip."
         exit 1
     fi
 }
 
 detect_missing_python_packages() {
-    python3 - <<'PY'
+    "$PYTHON_BIN" - <<'PY'
 import importlib
 requirements = {
     "MAVProxy": "mavproxy",
@@ -391,13 +481,8 @@ ensure_python_packages() {
 
     info "Missing Python packages detected: ${missing_packages[*]}"
 
-    if ! command_exists python3; then
-        error "python3 not available; cannot install Python dependencies."
-        exit 1
-    fi
-
-    if ! command_exists pip3 && ! python3 -m pip --version >/dev/null 2>&1; then
-        error "pip is not available. Install python3-pip and re-run the installer."
+    if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+        error "pip is not available for $PYTHON_BIN. Install python3-pip or ensure the selected environment has pip."
         exit 1
     fi
 
@@ -411,13 +496,13 @@ ensure_python_packages() {
 
 verify_python_environment() {
     info "Verifying Python environment …"
-    if python3 - <<'PY'
+    if "$PYTHON_BIN" - <<'PY'
 import importlib
 import sys
 required = {
-    "MAVProxy": "python3-mavproxy",
-    "pymavlink": "python3-pymavlink",
-    "pygame": "python3-pygame",
+    "MAVProxy": "MAVProxy or mavproxy",
+    "pymavlink": "pymavlink",
+    "pygame": "pygame",
 }
 missing = []
 for module, package in required.items():
@@ -440,7 +525,7 @@ PY
 }
 
 detect_existing_mavproxy_paths() {
-    python3 - <<'PY'
+    "$PYTHON_BIN" - <<'PY'
 from pathlib import Path
 import importlib.util
 try:
@@ -580,7 +665,10 @@ configure_dialout_group() {
     fi
 
     local target_user
-    target_user=${SUDO_USER:-$USER}
+    target_user=${SUDO_USER:-${USER:-}}
+    if [[ -z $target_user ]]; then
+        target_user=$(id -un 2>/dev/null || true)
+    fi
 
     if [[ -z "$target_user" || "$target_user" == "root" ]]; then
         warn "Skipping dialout group configuration (no non-root user detected)."
@@ -627,7 +715,7 @@ run_environment_checks() {
     fi
 
     info "Performing module import smoke test …"
-    if python3 - <<'PY'
+    if "$PYTHON_BIN" - <<'PY'
 import importlib
 modules = ["MAVProxy.modules.lib.mp_module", "pymavlink", "pygame"]
 for name in modules:
@@ -666,6 +754,9 @@ main() {
     fi
 
     ensure_apt_dependencies
+
+    configure_python_installation
+    info "Python operations will target $PYTHON_CONTEXT_DESC."
 
     ensure_python_packages
 
