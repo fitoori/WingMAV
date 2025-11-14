@@ -61,6 +61,17 @@ Useful flags:
 
 See `./install.sh --help` for the full list of options, including ways to
 skip specific steps if you have already configured part of the system.
+The script will:
+
+1. Detect or create a MAVProxy modules directory and install
+   `mavproxy_wingmav.py` there.
+2. Install required packages (`python3-mavproxy`, `python3-pymavlink`,
+   `python3-pygame`, etc.) via `apt` when available.
+3. Copy the optional `wingmav-proxy` helper launcher into
+   `/usr/local/bin` (or `~/.local/bin` when sudo is not used).
+4. Add the invoking user to the `dialout` group to ensure serial
+   permissions.
+5. Run verification checks (Python imports and `mavproxy.py --version`).
 
 After the installer finishes, you can start MAVProxy with the WingMAV
 module using `mavproxy.py --load-module=rc,wingmav`, or add the
@@ -70,3 +81,20 @@ following to your `~/.mavinit.rc` file to load it automatically:
 module load wingmav
 module load rc
 ```
+
+## Always-on MAVProxy orchestrator
+
+For unattended routers or ground stations, the repository now includes
+`wingmav_orchestrator.py`.  This supervisor can be launched automatically at
+login (for example from `~/.profile` or a systemd user service) to keep a
+serial MAVProxy link alive while opportunistically loading the WingMAV joystick
+module.
+
+```bash
+./wingmav_orchestrator.py \
+    --master=/dev/ttyUSB0 --baud=115200 --out udp:127.0.0.1:14550
+```
+
+If MAVProxy exits, the orchestrator restarts it immediately.  After repeated
+failures it automatically disables WingMAV so telemetry continues to flow, and
+adds extra diagnostic flags when problems persist.
