@@ -21,11 +21,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import select
 import signal
 import subprocess
 import sys
 import textwrap
-import threading
 import time
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -35,34 +35,16 @@ DEFAULT_OUT = "udp:127.0.0.1:14550"
 DEFAULT_BAUD = 115200
 
 
-class OutputStreamer(threading.Thread):
-    """Copy child process output to stdout with a prefix."""
-
-    def __init__(self, pipe, prefix: str) -> None:
-        super().__init__(daemon=True)
-        self.pipe = pipe
-        self.prefix = prefix
-
-    def run(self) -> None:
-        try:
-            for line in iter(self.pipe.readline, ""):
-                if not line:
-                    break
-                sys.stdout.write(f"[{self.prefix}] {line}")
-                sys.stdout.flush()
-        finally:
-            self.pipe.close()
-
-
 class MAVProxyOrchestrator:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.failures = 0
-        self.current_proc: Optional[subprocess.Popen[str]] = None
+        self.current_proc: Optional[subprocess.Popen] = None
         self.stop_requested = False
         self.wingmav_enabled = True
         self.diagnostic_mode = False
         self.repo_root = Path(__file__).resolve().parent
+        self._pty_master: Optional[int] = None
 
     # ------------------------------------------------------------------
     def build_command(self) -> List[str]:
@@ -104,24 +86,91 @@ class MAVProxyOrchestrator:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
 
+        master_fd, slave_fd = os.openpty()
+
+        # Launch MAVProxy connected to the slave side of the pseudo-terminal so
+        # interactive users can work with it as if it were running directly in
+        # the foreground.
         self.current_proc = subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
             env=env,
+            close_fds=True,
         )
 
-        assert self.current_proc.stdout is not None
-        streamer = OutputStreamer(self.current_proc.stdout, "MAVProxy")
-        streamer.start()
+        os.close(slave_fd)
+        self._pty_master = master_fd
+
+        # Forward data between the controlling terminal and the MAVProxy child
+        # while it is alive.  This keeps prompts responsive and allows
+        # operators to type commands directly into MAVProxy when needed.
+        stdin_fd: Optional[int]
+        try:
+            stdin_fd = sys.stdin.fileno()
+        except (AttributeError, OSError):
+            stdin_fd = None
+
+        try:
+            stdout_fd = sys.stdout.fileno()
+        except (AttributeError, OSError):
+            stdout_fd = None
+
+        fds = [master_fd]
+        if stdin_fd is not None:
+            fds.append(stdin_fd)
 
         start_time = time.time()
+        while True:
+            if self.stop_requested and self.current_proc.poll() is None:
+                self.current_proc.terminate()
+
+            if self.current_proc.poll() is not None:
+                break
+
+            try:
+                readable, _, _ = select.select(fds, [], [], 0.1)
+            except InterruptedError:
+                continue
+
+            if master_fd in readable:
+                try:
+                    data = os.read(master_fd, 1024)
+                except OSError:
+                    data = b""
+                if not data:
+                    break
+                if stdout_fd is not None:
+                    os.write(stdout_fd, data)
+                else:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+
+            if stdin_fd is not None and stdin_fd in readable:
+                try:
+                    user_input = os.read(stdin_fd, 1024)
+                except OSError:
+                    user_input = b""
+                if not user_input:
+                    try:
+                        os.close(master_fd)
+                    except OSError:
+                        pass
+                    self._pty_master = None
+                    break
+                os.write(master_fd, user_input)
+
         try:
             return_code = self.current_proc.wait()
         finally:
             self.current_proc = None
-            streamer.join(timeout=1)
+            if self._pty_master is not None:
+                try:
+                    os.close(self._pty_master)
+                except OSError:
+                    pass
+            self._pty_master = None
 
         runtime = time.time() - start_time
         print(f"MAVProxy exited with return code {return_code} after {runtime:.1f}s")
