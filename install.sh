@@ -4,9 +4,6 @@ set -euo pipefail
 # WingMAV setup wizard. This installer detects a MAVProxy installation,
 # installs the WingMAV module, optionally deploys the helper runner script,
 # manages permissions, and performs environment checks.
-# Intelligent installer for the WingMAV MAVProxy module.
-# This script detects a MAVProxy installation, installs required
-# dependencies, deploys the WingMAV module, and verifies the setup.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT="$SCRIPT_DIR"
@@ -24,16 +21,15 @@ Usage: ./install.sh [options]
 
 Options:
   -y, --yes               Automatically answer "yes" to all prompts.
-      --dry-run           Show the actions that would be taken without
-                          modifying the system.
+      --dry-run           Show the actions that would be taken without modifying the system.
       --module-dir DIR    Install the WingMAV module into DIR.
       --runner-target F   Install the wingmav-proxy helper script at F.
       --skip-apt          Do not attempt to install apt packages.
       --skip-dialout      Skip adding the invoking user to the dialout group.
       --skip-runner       Skip installing the wingmav-proxy helper script.
       --skip-checks       Skip the environment verification checks.
-      --non-interactive   Assume defaults for all prompts (implies --yes for
-                          actions whose default is "yes").
+      --non-interactive   Assume defaults for all prompts (implies --yes for actions
+                          whose default is "yes").
   -h, --help              Show this help message and exit.
 USAGE
 }
@@ -210,10 +206,6 @@ init_privilege_helper() {
     if [[ $EUID -eq 0 ]]; then
         SUDO=""
         PRIVILEGE_AVAILABLE=true
-# Determine whether elevated privileges are available.
-init_privilege_helper() {
-    if [[ $EUID -eq 0 ]]; then
-        SUDO=""
         return
     fi
 
@@ -269,21 +261,12 @@ ensure_apt_dependencies() {
         return
     fi
 
-    else
-        error "This script requires root privileges for some operations. Install sudo or run as root."
-        exit 1
-    fi
-}
-
-# Install missing dependencies via apt-get when available.
-ensure_apt_dependencies() {
     if ! command_exists apt-get; then
         warn "apt-get not available; skipping automatic package installation."
         return
     fi
 
-    local packages=(python3 python3-pip python3-venv joystick)
-    local packages=(python3 python3-pip python3-mavproxy python3-pymavlink python3-pygame joystick)
+    local packages=(python3 python3-pip python3-venv python3-mavproxy python3-pymavlink python3-pygame joystick)
     local missing=()
     for pkg in "${packages[@]}"; do
         if ! dpkg -s "$pkg" >/dev/null 2>&1; then
@@ -371,8 +354,9 @@ pip_install_packages() {
             warn "Initial pip install failed; retrying with --break-system-packages"
             args+=(--break-system-packages)
             used_break=true
-            run_cmd "${pip_cmd[@]}" "${args[@]}" "${packages[@]}"
-            return
+            if run_cmd "${pip_cmd[@]}" "${args[@]}" "${packages[@]}"; then
+                return 0
+            fi
         fi
 
         error "Failed to install Python packages via pip."
@@ -383,13 +367,11 @@ pip_install_packages() {
 detect_missing_python_packages() {
     python3 - <<'PY'
 import importlib
-
 requirements = {
     "MAVProxy": "mavproxy",
     "pymavlink": "pymavlink",
     "pygame": "pygame",
 }
-
 for module, package in requirements.items():
     try:
         importlib.import_module(module)
@@ -433,22 +415,6 @@ verify_python_environment() {
 import importlib
 import sys
 required = {
-    "MAVProxy": "pip package 'mavproxy'",
-    "pymavlink": "pip package 'pymavlink'",
-    "pygame": "pip package 'pygame'",
-    info "Installing missing apt packages: ${missing[*]}"
-    $SUDO apt-get update
-    $SUDO apt-get install -y "${missing[@]}"
-}
-
-# Verify that required Python modules are importable.
-verify_python_environment() {
-    info "Verifying Python environment …"
-    python3 - <<'PY'
-import importlib
-import sys
-
-required = {
     "MAVProxy": "python3-mavproxy",
     "pymavlink": "python3-pymavlink",
     "pygame": "python3-pygame",
@@ -457,10 +423,8 @@ missing = []
 for module, package in required.items():
     try:
         importlib.import_module(module)
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:
         missing.append(f"{module} (install via {package}): {exc}")
-        missing.append(f"{module} (install via apt package '{package}'): {exc}")
-
 if missing:
     for message in missing:
         print(message)
@@ -475,10 +439,6 @@ PY
     fi
 }
 
-    info "Python dependencies look good."
-}
-
-# Detect potential MAVProxy module directories from the Python installation.
 detect_existing_mavproxy_paths() {
     python3 - <<'PY'
 from pathlib import Path
@@ -487,12 +447,9 @@ try:
     spec = importlib.util.find_spec("MAVProxy.modules")
 except ModuleNotFoundError:
     spec = None
-
-spec = importlib.util.find_spec("MAVProxy.modules")
 if spec and spec.submodule_search_locations:
     for location in spec.submodule_search_locations:
-        path = Path(location).resolve()
-        print(path)
+        print(Path(location).resolve())
 PY
 }
 
@@ -502,7 +459,7 @@ select_install_directory() {
         return
     fi
 
-    local detected_paths
+    local detected_paths=()
     mapfile -t detected_paths < <(detect_existing_mavproxy_paths || true)
 
     if ((${#detected_paths[@]} > 0)); then
@@ -523,23 +480,6 @@ select_install_directory() {
     local chosen
     chosen=$(prompt_for_path "Directory to install the WingMAV module" "$default_path")
     expand_path "$chosen"
-# Choose the target directory for installing the WingMAV module.
-select_install_directory() {
-    local detected_paths user_path
-    mapfile -t detected_paths < <(detect_existing_mavproxy_paths)
-
-    if ((${#detected_paths[@]} > 0)); then
-        info "Detected MAVProxy module paths:"
-        for path in "${detected_paths[@]}"; do
-            echo "  - $path"
-        done
-    else
-        warn "No MAVProxy module path detected from Python."
-    fi
-
-    user_path="${MAVPROXY_HOME:-$HOME/.mavproxy}/modules"
-    mkdir -p "$user_path"
-    echo "$user_path"
 }
 
 install_wingmav_module() {
@@ -630,21 +570,6 @@ install_runner_script() {
 
     if [[ $target == "$HOME/.local/bin"/* ]]; then
         warn "Ensure $HOME/.local/bin is in your PATH."
-    install -Dm755 "$REPO_ROOT/$MODULE_NAME" "$target_file"
-}
-
-install_runner_script() {
-    local target
-    if [[ -z ${SUDO:-} && $EUID -ne 0 ]]; then
-        target="$HOME/.local/bin/wingmav-proxy"
-        mkdir -p "$(dirname "$target")"
-        install -Dm755 "$REPO_ROOT/$RUNNER_NAME" "$target"
-        info "Installed helper runner to $target"
-        warn "Ensure $HOME/.local/bin is in your PATH."
-    else
-        target="/usr/local/bin/wingmav-proxy"
-        $SUDO install -Dm755 "$REPO_ROOT/$RUNNER_NAME" "$target"
-        info "Installed helper runner to $target"
     fi
 }
 
@@ -654,7 +579,6 @@ configure_dialout_group() {
         return
     fi
 
-    local target_user=${SUDO_USER:-$USER}
     local target_user
     target_user=${SUDO_USER:-$USER}
 
@@ -684,12 +608,6 @@ configure_dialout_group() {
     else
         run_cmd usermod -a -G dialout "$target_user"
     fi
-        info "User '$target_user' already in dialout group."
-        return
-    fi
-
-    info "Adding user '$target_user' to dialout group"
-    $SUDO usermod -a -G dialout "$target_user"
     warn "User '$target_user' must log out and back in for dialout membership to take effect."
 }
 
@@ -710,26 +628,17 @@ run_environment_checks() {
 
     info "Performing module import smoke test …"
     if python3 - <<'PY'
-    if command_exists mavproxy.py; then
-        info "MAVProxy version:"
-        mavproxy.py --version || warn "Unable to get MAVProxy version."
-    else
-        warn "mavproxy.py not found in PATH. You may need to adjust your PATH or install MAVProxy."
-    fi
-
-    info "Performing module import smoke test …"
-    python3 - <<'PY'
 import importlib
 modules = ["MAVProxy.modules.lib.mp_module", "pymavlink", "pygame"]
 for name in modules:
     importlib.import_module(name)
 print("All required modules imported successfully.")
 PY
-        then
-            info "Python import smoke test passed."
-        else
-            warn "Python import smoke test failed. Verify your Python environment."
-        fi
+    then
+        info "Python import smoke test passed."
+    else
+        warn "Python import smoke test failed. Verify your Python environment."
+    fi
 }
 
 print_post_install_instructions() {
@@ -780,18 +689,6 @@ main() {
     run_environment_checks
 
     success "WingMAV installation steps completed."
-    ensure_apt_dependencies
-    verify_python_environment || {
-        error "Python environment verification failed. Install the missing modules above and re-run."
-        exit 1
-    }
-    local module_dir
-    module_dir=$(select_install_directory)
-    install_wingmav_module "$module_dir"
-    install_runner_script
-    configure_dialout_group
-    run_environment_checks
-    success "WingMAV installation completed."
     print_post_install_instructions
 }
 
