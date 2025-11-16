@@ -120,4 +120,11 @@ python diagnostic_wingmav.py --help
     --master=/dev/ttyUSB0 --baud=115200 --out udp:127.0.0.1:14550
 ```
 
-If MAVProxy repeatedly fails, the orchestrator restarts it, temporarily disables WingMAV to keep telemetry flowing, and adds extra diagnostics when problems persist.
+If MAVProxy exits, the orchestrator restarts it immediately.  After repeated
+failures it automatically disables WingMAV so telemetry continues to flow, and
+adds extra diagnostic flags when problems persist. To persist restart history
+for post-flight audits, enable debug mode and provide a log path, for example:
+
+```bash
+WINGMAV_ORCHESTRATOR_DEBUG=1 ./wingmav_orchestrator.py --debug --log-file=/tmp/wingmav_orchestrator.log
+```
