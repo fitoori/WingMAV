@@ -27,7 +27,8 @@ Manual-only mode:
       or released. RC override is still applied, allowing the current mode to accept or
       reject the commands.
     - Enable via ``module load wingmav manual_only=1`` inside MAVProxy or pass
-      ``--manual-only`` to ``run_wingmav_proxy.py``.
+      ``--manual-only`` to the helper launcher (``wingmav-proxy`` when installed, or
+      ``python run_wingmav_proxy.py`` from the repository checkout).
     
 ## Automated installation
 
