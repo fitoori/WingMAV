@@ -30,6 +30,8 @@ import time
 from pathlib import Path
 from typing import Iterable, List, Optional
 
+from run_wingmav_proxy import WINGMAV_FAILURE_EXIT
+
 DEFAULT_MASTER = "/dev/ttyUSB0"
 DEFAULT_OUT = "udp:127.0.0.1:14550"
 DEFAULT_BAUD = 115200
@@ -62,6 +64,7 @@ class MAVProxyOrchestrator:
             command.extend(self.args.extra)
             command.append("--auto-load")
             command.append("--forward-stdin")
+            command.append("--supervised-by=orchestrator")
         else:
             command = [self.args.mavproxy_bin, f"--master={master}"]
             if baud:
@@ -175,7 +178,14 @@ class MAVProxyOrchestrator:
         runtime = time.time() - start_time
         print(f"MAVProxy exited with return code {return_code} after {runtime:.1f}s")
 
-        if return_code == 0 and runtime >= self.args.success_reset:
+        if return_code == WINGMAV_FAILURE_EXIT:
+            print(
+                "WingMAV runner indicated module failure — disabling WingMAV until manual reset."
+            )
+            self.wingmav_enabled = False
+            self.failures = max(self.failures, self.args.disable_wingmav_after)
+            self.diagnostic_mode = True
+        elif return_code == 0 and runtime >= self.args.success_reset:
             # Treat as successful run; reset diagnostics to give WingMAV another try.
             self.failures = 0
             if not self.wingmav_enabled:

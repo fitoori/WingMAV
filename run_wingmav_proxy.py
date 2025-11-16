@@ -30,7 +30,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Iterable, List, Optional, TextIO
+from typing import Callable, Iterable, List, Optional, TextIO
 
 
 @functools.lru_cache(maxsize=1)
@@ -84,17 +84,24 @@ def build_mavproxy_command(
     return command
 
 
-def stream_output(pipe: TextIO, prefix: str) -> None:
+def stream_output(
+    pipe: TextIO, prefix: str, on_line: Optional[Callable[[str], None]] = None
+) -> None:
     """Continuously forward MAVProxy output to this program's stdout."""
 
     try:
         for line in iter(pipe.readline, ""):
             if not line:
                 break
+            if on_line:
+                on_line(line)
             sys.stdout.write(f"[{prefix}] {line}")
             sys.stdout.flush()
     finally:
         pipe.close()
+
+
+WINGMAV_FAILURE_EXIT = 42
 
 
 class WingMAVProxyRunner:
@@ -110,6 +117,9 @@ class WingMAVProxyRunner:
         self._wingmav_args = []
         if getattr(args, "manual_only", False):
             self._wingmav_args.append("manual_only=1")
+        self.supervised_by = args.supervised_by
+        self._wingmav_failure_detected = False
+        self._last_returncode: Optional[int] = None
 
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -136,6 +146,7 @@ class WingMAVProxyRunner:
             else:
                 env["PYTHONPATH"] = repo_path
 
+        self._last_returncode = None
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -148,7 +159,9 @@ class WingMAVProxyRunner:
 
         assert self.process.stdout is not None
         self.output_thread = threading.Thread(
-            target=stream_output, args=(self.process.stdout, "MAVProxy"), daemon=True
+            target=stream_output,
+            args=(self.process.stdout, "MAVProxy", self._handle_mavproxy_line),
+            daemon=True,
         )
         self.output_thread.start()
 
@@ -176,6 +189,38 @@ class WingMAVProxyRunner:
         self.process.stdin.flush()
 
     # ------------------------------------------------------------------
+    def _handle_mavproxy_line(self, line: str) -> None:
+        """Watch MAVProxy output for WingMAV specific failures."""
+
+        if self._wingmav_failure_detected:
+            return
+
+        lower_line = line.lower()
+        if "wingmav" not in lower_line:
+            return
+
+        failure_reason: Optional[str] = None
+        if "failed to load module" in lower_line:
+            failure_reason = "MAVProxy reported it failed to load WingMAV."
+        elif "no module named" in lower_line and "wingmav" in lower_line:
+            failure_reason = "WingMAV Python module was not found in MAVProxy's path."
+        elif "exception" in lower_line or "traceback" in lower_line:
+            failure_reason = "WingMAV module raised an exception inside MAVProxy."
+
+        if failure_reason:
+            self._report_wingmav_failure(failure_reason)
+
+    # ------------------------------------------------------------------
+    def _report_wingmav_failure(self, reason: str) -> None:
+        self._wingmav_failure_detected = True
+        print("Detected WingMAV failure: " + reason)
+        if self.supervised_by:
+            print(
+                "Supervised by", self.supervised_by, "— signalling orchestrator for failover."
+            )
+        self.request_stop()
+
+    # ------------------------------------------------------------------
     def run(self) -> int:
         if not self.process and not self._stop_requested:
             self.start()
@@ -185,7 +230,7 @@ class WingMAVProxyRunner:
         try:
             while not self._stop_requested:
                 if self.process.poll() is not None:
-                    return self.process.returncode or 0
+                    break
 
                 try:
                     rlist, _, _ = select.select([sys.stdin], [], [], self.args.poll_interval)
@@ -204,6 +249,10 @@ class WingMAVProxyRunner:
             print("Received Ctrl+C. Stopping MAVProxy …")
         finally:
             self.stop()
+        if self._wingmav_failure_detected:
+            return WINGMAV_FAILURE_EXIT
+        if self._last_returncode is not None:
+            return self._last_returncode or 0
         return 0
 
     # ------------------------------------------------------------------
@@ -218,6 +267,7 @@ class WingMAVProxyRunner:
             except subprocess.TimeoutExpired:
                 print("MAVProxy did not exit in time; killing …")
                 self.process.kill()
+        self._last_returncode = self.process.returncode
         self.process = None
         if self.output_thread and self.output_thread.is_alive():
             self.output_thread.join(timeout=1)
@@ -281,6 +331,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--manual-only",
         action="store_true",
         help="Load WingMAV in manual-only mode (no automatic flight-mode changes)",
+    )
+    parser.add_argument(
+        "--supervised-by",
+        default=None,
+        help="Name of the higher-level supervisor managing this runner",
     )
 
     return parser.parse_args(argv)
