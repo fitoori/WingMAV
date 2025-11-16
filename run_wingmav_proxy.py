@@ -150,15 +150,23 @@ class WingMAVProxyRunner:
                 env["PYTHONPATH"] = repo_path
 
         self._last_returncode = None
-        self.process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env=env,
-        )
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+        except OSError as exc:
+            # Common when mavproxy.py is missing or lacks execute permission.
+            self.process = None
+            self._last_returncode = 1
+            self._stop_requested = True
+            print(f"ERROR: Failed to launch MAVProxy: {exc}")
+            return
 
         assert self.process.stdout is not None
         self.output_thread = threading.Thread(
@@ -188,8 +196,13 @@ class WingMAVProxyRunner:
     def _write_to_mavproxy(self, data: str) -> None:
         if not self.process or not self.process.stdin:
             return
-        self.process.stdin.write(data)
-        self.process.stdin.flush()
+        try:
+            self.process.stdin.write(data)
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            print(f"ERROR: Failed to write to MAVProxy stdin: {exc}")
+            self._last_returncode = self.process.returncode if self.process else 1
+            self.request_stop()
 
     # ------------------------------------------------------------------
     def _handle_mavproxy_line(self, line: str) -> None:
@@ -228,6 +241,8 @@ class WingMAVProxyRunner:
         if not self.process and not self._stop_requested:
             self.start()
         if not self.process:
+            if self._last_returncode is not None:
+                return self._last_returncode
             return 0
 
         try:
