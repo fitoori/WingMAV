@@ -107,6 +107,9 @@ class WingMAVProxyRunner:
         self.auto_load = args.auto_load
         self.joystick_loaded = False
         self._stop_requested = False
+        self._wingmav_args = []
+        if getattr(args, "manual_only", False):
+            self._wingmav_args.append("manual_only=1")
 
     # ------------------------------------------------------------------
     def start(self) -> None:
@@ -159,7 +162,10 @@ class WingMAVProxyRunner:
         if self.joystick_loaded:
             return
         print("Loading WingMAV joystick module …")
-        self._write_to_mavproxy("module load wingmav\n")
+        load_cmd = "module load wingmav"
+        if self._wingmav_args:
+            load_cmd += " " + " ".join(self._wingmav_args)
+        self._write_to_mavproxy(load_cmd + "\n")
         self.joystick_loaded = True
 
     # ------------------------------------------------------------------
@@ -270,6 +276,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--forward-stdin",
         action="store_true",
         help="Forward any STDIN received to MAVProxy after triggering the module",
+    )
+    parser.add_argument(
+        "--manual-only",
+        action="store_true",
+        help="Load WingMAV in manual-only mode (no automatic flight-mode changes)",
     )
 
     return parser.parse_args(argv)
