@@ -34,6 +34,24 @@ Date: March 5, 2025
 
 import time
 
+
+def _coerce_bool(value, default=False):
+    """Best-effort conversion of MAVProxy-style flag values to ``bool``."""
+
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "t", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "f", "no", "n", "off"}:
+            return False
+    return default
+
 try:
     import pygame  # type: ignore
 except ImportError:  # pragma: no cover - pygame optional for external integrations
@@ -67,6 +85,7 @@ class JoystickControlModule(mp_module.MPModule):
         init_pygame=True,
         auto_connect=True,
         pygame_module=None,
+        manual_override_only=False,
     ):
         """
         Initialize the joystick control module.
@@ -76,6 +95,7 @@ class JoystickControlModule(mp_module.MPModule):
         - ``init_pygame``: delay pygame setup when running in a headless test harness.
         - ``auto_connect``: defer joystick discovery until requested explicitly.
         - ``pygame_module``: inject a pygame-compatible shim for unit testing.
+        - ``manual_override_only``: skip flight mode changes when taking/relinquishing control.
         """
         super(JoystickControlModule, self).__init__(mpstate, "wingmav", "Joystick control module")
         # Use instance variable for logging configuration
@@ -101,6 +121,7 @@ class JoystickControlModule(mp_module.MPModule):
         self._pending_mode_failure = None
         self._pending_mode_plan = []
         self._pending_disarm_ack = None
+        self.manual_override_only = _coerce_bool(manual_override_only, False)
 
         # Initialize logging if enabled
         if self.log_enabled:
@@ -251,12 +272,17 @@ class JoystickControlModule(mp_module.MPModule):
         except Exception as e:
             self._log(f"ERROR reading joystick axes for centering: {e}", error=True)
             return
-        self._set_flight_mode(
-            "GUIDED",
-            success_msg="Trigger pressed → Entering GUIDED mode and enabling joystick control",
-            pending_msg="Trigger pressed → Requested GUIDED mode; awaiting confirmation before continuing.",
-            failure_msg="Trigger pressed → GUIDED mode switch FAILED, continuing in current mode.",
-        )
+        if self.manual_override_only:
+            self._log(
+                "Trigger pressed → Enabling joystick control without changing flight mode",
+            )
+        else:
+            self._set_flight_mode(
+                "GUIDED",
+                success_msg="Trigger pressed → Entering GUIDED mode and enabling joystick control",
+                pending_msg="Trigger pressed → Requested GUIDED mode; awaiting confirmation before continuing.",
+                failure_msg="Trigger pressed → GUIDED mode switch FAILED, continuing in current mode.",
+            )
         self.control_active = True
         self._send_override(force=True)
 
@@ -264,6 +290,9 @@ class JoystickControlModule(mp_module.MPModule):
         """Deactivate joystick control: clear overrides and revert to previous or safe flight mode."""
         self.control_active = False
         self._clear_rc_override()
+        if self.manual_override_only:
+            self._log("Trigger released → Joystick control disabled (flight mode unchanged)")
+            return
         target_mode = self.prev_mode if self.prev_mode else "LOITER"
         plan = [
             {
@@ -293,12 +322,18 @@ class JoystickControlModule(mp_module.MPModule):
         if self.control_active:
             self.control_active = False
             self._clear_rc_override()
-            self._set_flight_mode(
-                "LOITER",
-                success_msg="Joystick was active. Switching to LOITER for safety.",
-                pending_msg="Joystick was active. Requested LOITER mode for safety; awaiting confirmation.",
-                failure_msg="Joystick was active but failed to switch to LOITER for safety.",
-            )
+            if self.manual_override_only:
+                self._log(
+                    "Joystick was active. Manual-only mode leaves current flight mode unchanged.",
+                    error=True,
+                )
+            else:
+                self._set_flight_mode(
+                    "LOITER",
+                    success_msg="Joystick was active. Switching to LOITER for safety.",
+                    pending_msg="Joystick was active. Requested LOITER mode for safety; awaiting confirmation.",
+                    failure_msg="Joystick was active but failed to switch to LOITER for safety.",
+                )
         self.joystick = None
         self.joy_id = None
 
@@ -654,4 +689,13 @@ class JoystickControlModule(mp_module.MPModule):
 
 def init(mpstate, **kwargs):
     """Factory used by MAVProxy and external callers to construct the module."""
+    manual_override = kwargs.pop("manual_override_only", None)
+    if manual_override is None and "manual_only" in kwargs:
+        manual_override = kwargs.pop("manual_only")
+    if manual_override is None and "disable_mode_switching" in kwargs:
+        manual_override = kwargs.pop("disable_mode_switching")
+    enable_mode_switching = kwargs.pop("enable_mode_switching", None)
+    if manual_override is None and enable_mode_switching is not None:
+        manual_override = not _coerce_bool(enable_mode_switching, True)
+    kwargs["manual_override_only"] = _coerce_bool(manual_override, False)
     return JoystickControlModule(mpstate, **kwargs)
