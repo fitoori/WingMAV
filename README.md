@@ -105,4 +105,9 @@ module.
 
 If MAVProxy exits, the orchestrator restarts it immediately.  After repeated
 failures it automatically disables WingMAV so telemetry continues to flow, and
-adds extra diagnostic flags when problems persist.
+adds extra diagnostic flags when problems persist. To persist restart history
+for post-flight audits, enable debug mode and provide a log path, for example:
+
+```bash
+WINGMAV_ORCHESTRATOR_DEBUG=1 ./wingmav_orchestrator.py --debug --log-file=/tmp/wingmav_orchestrator.log
+```
