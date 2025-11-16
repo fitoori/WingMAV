@@ -27,6 +27,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -47,6 +48,39 @@ class MAVProxyOrchestrator:
         self.diagnostic_mode = False
         self.repo_root = Path(__file__).resolve().parent
         self._pty_master: Optional[int] = None
+        self.debug_enabled = bool(args.debug)
+        self.log_file = None
+        if self.debug_enabled and args.log_file:
+            try:
+                self.log_file = open(args.log_file, "a", buffering=1)
+            except OSError as exc:
+                print(f"WARNING: could not open log file {args.log_file!r}: {exc}")
+                self.log_file = None
+        elif args.log_file:
+            print(
+                "Debug mode is disabled; ignoring --log-file and writing only to the console."
+            )
+
+    # ------------------------------------------------------------------
+    def log(self, message: str) -> None:
+        timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = f"[{timestamp}] {message}"
+        print(line)
+        if self.log_file:
+            try:
+                self.log_file.write(line + "\n")
+                self.log_file.flush()
+            except OSError:
+                pass
+
+    # ------------------------------------------------------------------
+    def _close_log(self) -> None:
+        if self.log_file:
+            try:
+                self.log_file.close()
+            except OSError:
+                pass
+            self.log_file = None
 
     # ------------------------------------------------------------------
     def build_command(self) -> List[str]:
@@ -83,8 +117,7 @@ class MAVProxyOrchestrator:
     def run_once(self) -> int:
         command = self.build_command()
         pretty = " ".join(command)
-        print(f"Starting MAVProxy command: {pretty}")
-        sys.stdout.flush()
+        self.log(f"Starting MAVProxy command: {pretty}")
 
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
@@ -94,14 +127,26 @@ class MAVProxyOrchestrator:
         # Launch MAVProxy connected to the slave side of the pseudo-terminal so
         # interactive users can work with it as if it were running directly in
         # the foreground.
-        self.current_proc = subprocess.Popen(
-            command,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
-            env=env,
-            close_fds=True,
-        )
+        try:
+            self.current_proc = subprocess.Popen(
+                command,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                env=env,
+                close_fds=True,
+            )
+        except OSError as exc:
+            os.close(slave_fd)
+            os.close(master_fd)
+            self._pty_master = None
+            self.log(f"Failed to launch MAVProxy: {exc}")
+            self.failures += 1
+            if self.failures >= self.args.disable_wingmav_after:
+                self.wingmav_enabled = False
+            if self.failures >= self.args.enable_diagnostics_after:
+                self.diagnostic_mode = True
+            return 1
 
         os.close(slave_fd)
         self._pty_master = master_fd
@@ -176,10 +221,10 @@ class MAVProxyOrchestrator:
             self._pty_master = None
 
         runtime = time.time() - start_time
-        print(f"MAVProxy exited with return code {return_code} after {runtime:.1f}s")
+        self.log(f"MAVProxy exited with return code {return_code} after {runtime:.1f}s")
 
         if return_code == WINGMAV_FAILURE_EXIT:
-            print(
+            self.log(
                 "WingMAV runner indicated module failure — disabling WingMAV until manual reset."
             )
             self.wingmav_enabled = False
@@ -189,22 +234,22 @@ class MAVProxyOrchestrator:
             # Treat as successful run; reset diagnostics to give WingMAV another try.
             self.failures = 0
             if not self.wingmav_enabled:
-                print("Stable run detected — re-enabling WingMAV module on next restart.")
+                self.log("Stable run detected — re-enabling WingMAV module on next restart.")
             self.wingmav_enabled = True
             self.diagnostic_mode = False
         else:
             self.failures += 1
-            print(f"Failure count now {self.failures}")
+            self.log(f"Failure count now {self.failures}")
             if self.failures >= self.args.disable_wingmav_after:
                 if self.wingmav_enabled:
-                    print(
+                    self.log(
                         "Disabling WingMAV module due to repeated failures;"
                         " telemetry stream will continue without joystick support."
                     )
                 self.wingmav_enabled = False
             if self.failures >= self.args.enable_diagnostics_after:
                 if not self.diagnostic_mode:
-                    print("Enabling diagnostic MAVProxy options for additional insight.")
+                    self.log("Enabling diagnostic MAVProxy options for additional insight.")
                 self.diagnostic_mode = True
 
         return return_code
@@ -215,7 +260,7 @@ class MAVProxyOrchestrator:
             self.run_once()
             if self.stop_requested:
                 break
-            print(f"Restarting in {self.args.restart_delay}s …")
+            self.log(f"Restarting in {self.args.restart_delay}s …")
             for _ in range(int(self.args.restart_delay / 0.5)):
                 if self.stop_requested:
                     break
@@ -224,18 +269,20 @@ class MAVProxyOrchestrator:
                 remaining = self.args.restart_delay % 0.5
                 if remaining:
                     time.sleep(remaining)
+        self._close_log()
 
     # ------------------------------------------------------------------
     def request_stop(self, *_: object) -> None:
-        print("Stop requested — terminating child process if needed.")
+        self.log("Stop requested — terminating child process if needed.")
         self.stop_requested = True
         if self.current_proc and self.current_proc.poll() is None:
             self.current_proc.terminate()
             try:
                 self.current_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                print("Child did not exit promptly; killing …")
+                self.log("Child did not exit promptly; killing …")
                 self.current_proc.kill()
+        self._close_log()
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -299,6 +346,17 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         type=float,
         default=120.0,
         help="Runtime (seconds) treated as a successful session that resets counters",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=os.environ.get("WINGMAV_ORCHESTRATOR_LOG"),
+        help="Optional path to append orchestrator log messages",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=os.environ.get("WINGMAV_ORCHESTRATOR_DEBUG") == "1",
+        help="Enable debug mode; required for writing log files",
     )
 
     return parser.parse_args(argv)
