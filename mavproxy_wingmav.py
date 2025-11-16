@@ -122,6 +122,7 @@ class JoystickControlModule(mp_module.MPModule):
         self._pending_mode_plan = []
         self._pending_disarm_ack = None
         self.manual_override_only = _coerce_bool(manual_override_only, False)
+        self._joystick_state_msg = None
 
         # Initialize logging if enabled
         if self.log_enabled:
@@ -184,7 +185,7 @@ class JoystickControlModule(mp_module.MPModule):
         self._last_joystick_retry = time.time()
         count = self._pg.joystick.get_count()
         if count < 1:
-            self._log("No joystick detected. Waiting for a joystick connection.")
+            self._log_state_once("waiting", "Joystick ready; waiting for device.")
             return False
         try:
             js = self._pg.joystick.Joystick(0)
@@ -194,7 +195,9 @@ class JoystickControlModule(mp_module.MPModule):
             name = js.get_name()
             axes = js.get_numaxes()
             buttons = js.get_numbuttons()
-            self._log(f"Joystick connected: '{name}' (axes={axes}, buttons={buttons})")
+            self._log_state_once(
+                "connected", f"Joystick connected: {name} ({axes} axes, {buttons} buttons)"
+            )
             return True
         except Exception as e:
             self._log(f"Error initializing joystick: {e}", error=True)
@@ -221,15 +224,15 @@ class JoystickControlModule(mp_module.MPModule):
                     if not self.control_active:
                         self._activate_control()
                 elif event.button == BTN_RTL:
-                    self._log("RTL button pressed → Switching to RTL mode")
+                    self._log("RTL button: requesting RTL mode")
                     self._set_flight_mode(
                         "RTL",
-                        success_msg="RTL button pressed → Vehicle confirmed RTL mode",
-                        pending_msg="RTL button pressed → Requested RTL mode; awaiting confirmation.",
-                        failure_msg="RTL button pressed → Failed to change to RTL mode.",
+                        success_msg="RTL button: RTL confirmed",
+                        pending_msg="RTL button: awaiting RTL ack",
+                        failure_msg="RTL button: RTL change failed",
                     )
                 elif event.button == BTN_DISARM:
-                    self._log("Disarm button pressed → Disarming the vehicle")
+                    self._log("Disarm button: sending disarm")
                     self._disarm_vehicle()
             elif event.type == self._pg.JOYBUTTONUP and self.joystick and event.joy == self.joy_id:
                 if event.button == BTN_TRIGGER:
@@ -240,7 +243,7 @@ class JoystickControlModule(mp_module.MPModule):
                     self._send_override()
             elif event.type == self._pg.JOYDEVICEADDED:
                 if self.joystick is None:
-                    self._log("Joystick device added. Attempting to initialize.")
+                    self._log("Joystick added; initializing.")
                     self._connect_joystick()
             elif event.type == self._pg.JOYDEVICEREMOVED:
                 if self.joystick and event.joy == self.joy_id:
@@ -273,15 +276,13 @@ class JoystickControlModule(mp_module.MPModule):
             self._log(f"ERROR reading joystick axes for centering: {e}", error=True)
             return
         if self.manual_override_only:
-            self._log(
-                "Trigger pressed → Enabling joystick control without changing flight mode",
-            )
+            self._log("Trigger pressed: control on (mode unchanged)")
         else:
             self._set_flight_mode(
                 "GUIDED",
-                success_msg="Trigger pressed → Entering GUIDED mode and enabling joystick control",
-                pending_msg="Trigger pressed → Requested GUIDED mode; awaiting confirmation before continuing.",
-                failure_msg="Trigger pressed → GUIDED mode switch FAILED, continuing in current mode.",
+                success_msg="Trigger pressed: GUIDED and control on",
+                pending_msg="Trigger pressed: awaiting GUIDED ack",
+                failure_msg="Trigger pressed: GUIDED change failed; staying put",
             )
         self.control_active = True
         self._send_override(force=True)
@@ -291,51 +292,57 @@ class JoystickControlModule(mp_module.MPModule):
         self.control_active = False
         self._clear_rc_override()
         if self.manual_override_only:
-            self._log("Trigger released → Joystick control disabled (flight mode unchanged)")
+            self._log("Trigger released: control off (mode unchanged)")
             return
         target_mode = self.prev_mode if self.prev_mode else "LOITER"
         plan = [
             {
                 "mode": target_mode,
-                "success_msg": f"Trigger released → Joystick control disabled, switched to {target_mode} mode",
-                "pending_msg": f"Trigger released → Requested {target_mode} mode; awaiting confirmation.",
-                "failure_msg": f"Failed to revert to {target_mode}. Attempting fallback to LOITER.",
+                "success_msg": f"Trigger released: control off; now in {target_mode}",
+                "pending_msg": f"Trigger released: awaiting {target_mode} ack",
+                "failure_msg": f"Trigger released: {target_mode} failed; trying LOITER",
             },
             {
                 "mode": "LOITER",
-                "success_msg": "Trigger released → Joystick control disabled, switched to LOITER mode",
-                "pending_msg": "Trigger released → Requested LOITER mode; awaiting confirmation.",
-                "failure_msg": "Fallback to LOITER failed. Attempting fallback to STABILIZE.",
+                "success_msg": "Trigger released: control off; LOITER active",
+                "pending_msg": "Trigger released: awaiting LOITER ack",
+                "failure_msg": "LOITER fallback failed; trying STABILIZE",
             },
             {
                 "mode": "STABILIZE",
-                "success_msg": "Trigger released → Joystick control disabled, switched to STABILIZE mode",
-                "pending_msg": "Trigger released → Requested STABILIZE mode; awaiting confirmation.",
-                "failure_msg": "Trigger released → Joystick control disabled. WARNING: Failed to change flight mode!",
+                "success_msg": "Trigger released: control off; STABILIZE active",
+                "pending_msg": "Trigger released: awaiting STABILIZE ack",
+                "failure_msg": "Trigger released: control off; mode unchanged!",
             },
         ]
         self._attempt_mode_sequence(plan)
 
     def _handle_disconnection(self):
         """Handle joystick disconnection by clearing control and switching to safe mode."""
-        self._log("Joystick disconnected!", error=True)
+        self._log_state_once("disconnected", "Joystick disconnected.", error=True)
         if self.control_active:
             self.control_active = False
             self._clear_rc_override()
             if self.manual_override_only:
                 self._log(
-                    "Joystick was active. Manual-only mode leaves current flight mode unchanged.",
+                    "Joystick was active; manual-only leaves mode unchanged.",
                     error=True,
                 )
             else:
                 self._set_flight_mode(
                     "LOITER",
-                    success_msg="Joystick was active. Switching to LOITER for safety.",
-                    pending_msg="Joystick was active. Requested LOITER mode for safety; awaiting confirmation.",
-                    failure_msg="Joystick was active but failed to switch to LOITER for safety.",
+                    success_msg="Joystick active; LOITER for safety.",
+                    pending_msg="Joystick active; waiting for LOITER ack.",
+                    failure_msg="Joystick active; LOITER change failed.",
                 )
         self.joystick = None
         self.joy_id = None
+
+    def _log_state_once(self, state, message, *, error=False):
+        if self._joystick_state_msg == state:
+            return
+        self._joystick_state_msg = state
+        self._log(message, error=error)
 
     def _send_override(self, force=False):
         """
