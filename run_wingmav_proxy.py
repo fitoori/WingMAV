@@ -6,7 +6,10 @@ This helper launches a MAVProxy instance configured to find the
 be started before the "main" flight-control program.  The process keeps
 MAVProxy running in the background and watches its own STDIN for activity
 from the main program.  As soon as any data arrives it "side loads" the
-WingMAV joystick module so that joystick control becomes available.
+WingMAV joystick module so that joystick control becomes available.  When
+installed via ``install.sh`` this script is typically exposed on ``PATH`` as
+``wingmav-proxy``; when running directly from a checkout use the Python
+invocation shown below.
 
 Typical usage::
 
